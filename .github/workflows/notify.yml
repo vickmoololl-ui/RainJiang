@@ -1,10 +1,11 @@
-name: autoab 订单监控
+name: autoab 订单监控 - 云端定时
 
 on:
   schedule:
-    # 每 3 分钟运行一次
-    - cron: '*/3 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-check]
 
 jobs:
   check-orders:
