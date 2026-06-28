@@ -1,17 +1,6 @@
 """
 autoab.net 订单通知监控脚本
 定时检测新订单并通过 Telegram 推送通知
-
-用法：
-  1. 设置环境变量（或直接修改下方默认值）
-  2. python autoab_notify.py
-
-环境变量（推荐用于 GitHub Actions）：
-  AUTOAB_USERNAME     - autoab.net 用户名
-  AUTOAB_PASSWORD     - autoab.net 密码
-  AUTOAB_GRABID       - GrabID（默认 132）
-  TELEGRAM_BOT_TOKEN  - Telegram Bot Token
-  TELEGRAM_CHAT_ID    - Telegram 群组/用户 Chat ID
 """
 
 import os
@@ -32,7 +21,6 @@ except ImportError:
 # 配置
 # ============================================================
 
-# 从环境变量读取，也可直接修改默认值
 CONFIG = {
     "autoab_username": os.environ.get("AUTOAB_USERNAME", "Rain_jiang1203"),
     "autoab_password": os.environ.get("AUTOAB_PASSWORD", "123123"),
@@ -88,10 +76,8 @@ def notify_new_order(order: dict) -> bool:
     match_mode = order.get("match_mode", "?")
     from_loc = order.get("from_location", "?")
     to_loc = order.get("to_location", "?")
-    order_no = order.get("order_no", "?")
     remark = order.get("remark", "")
 
-    # 解析 mode 的中文含义
     mode_map = {"to": "去机场", "from": "从机场出发", "fare": "一口价"}
     mode_cn = mode_map.get(match_mode, match_mode)
 
@@ -109,11 +95,6 @@ def notify_new_order(order: dict) -> bool:
     return send_telegram(message)
 
 
-def notify_test() -> bool:
-    """发送测试消息"""
-    return send_telegram("✅ <b>autoab 通知监控已启动</b>\n等待新订单中...")
-
-
 # ============================================================
 # autoab.net API
 # ============================================================
@@ -126,7 +107,6 @@ def create_session():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
 
-    # 登录
     login_data = {
         "username": CONFIG["autoab_username"],
         "password": CONFIG["autoab_password"],
@@ -186,12 +166,10 @@ def main():
     print(f"[*] 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"[*] 目标 GrabID: {CONFIG['autoab_grabid']}")
 
-    # 检查 Telegram 配置
     if not CONFIG["telegram_bot_token"] or not CONFIG["telegram_chat_id"]:
         print("[!] 请设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID")
         return
 
-    # 登录
     try:
         session = create_session()
     except Exception as e:
@@ -199,14 +177,11 @@ def main():
         send_telegram(f"❌ <b>autoab 通知出错</b>\n登录失败: {e}")
         return
 
-    # 加载已通知状态
     notified_ids = load_state()
     print(f"[*] 已通知订单数: {len(notified_ids)}")
 
-    # 发送启动通知
-    notify_test()
+    # ========= 已移除启动通知 =========
 
-    # 轮询新订单
     data = poll_orders(session)
     orders = data.get("list", [])
 
@@ -214,7 +189,6 @@ def main():
         print("[*] 没有新订单")
         return
 
-    # 找出未通知的新订单
     new_orders = [o for o in orders if o["id"] not in notified_ids]
     print(f"[*] 本次获取 {len(orders)} 条，新订单 {len(new_orders)} 条")
 
@@ -224,7 +198,6 @@ def main():
         notified_ids.add(order["id"])
         time.sleep(0.5)
 
-    # 保存状态
     save_state(notified_ids)
     print(f"[*] 完成，已通知 ID 数: {len(notified_ids)}")
 
