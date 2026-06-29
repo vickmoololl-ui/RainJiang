@@ -1,6 +1,6 @@
 """
 autoab.net 订单通知监控脚本
-定时检测新订单并通过 Telegram 推送通知
+带 session 持久化，减少重复登录
 """
 import os
 import json
@@ -14,9 +14,6 @@ except ImportError:
     print("请先安装 requests: pip install requests")
     sys.exit(1)
 
-# ============================================================
-# 配置（通过环境变量传入，无敏感默认值）
-# ============================================================
 CONFIG = {
     "autoab_username": os.environ.get("AUTOAB_USERNAME", ""),
     "autoab_password": os.environ.get("AUTOAB_PASSWORD", ""),
@@ -27,6 +24,7 @@ CONFIG = {
 
 BASE_URL = "https://www.autoab.net/index.php/api"
 LOGIN_URL = f"{BASE_URL}/user/login"
+PROFILE_URL = f"{BASE_URL}/user/profile"
 POLL_URL = f"{BASE_URL}/grab/poll_orders"
 STATE_FILE = Path(__file__).parent / "state.json"
 
@@ -35,7 +33,6 @@ def send_telegram(message: str) -> bool:
     token = CONFIG["telegram_bot_token"]
     chat_id = CONFIG["telegram_chat_id"]
     if not token or not chat_id:
-        print("[!] Telegram 未配置，跳过推送")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
@@ -44,10 +41,9 @@ def send_telegram(message: str) -> bool:
             "text": message,
             "parse_mode": "HTML",
         }, timeout=15)
-        data = resp.json()
-        return data.get("ok", False)
+        return resp.json().get("ok", False)
     except Exception as e:
-        print(f"[x] Telegram 请求异常: {e}")
+        print(f"[x] Telegram 异常: {e}")
         return False
 
 
@@ -74,7 +70,8 @@ def notify_new_order(order: dict) -> bool:
     return send_telegram(message)
 
 
-def create_session():
+def login_and_get_session() -> requests.Session:
+    """登录并返回带 cookie 的 session"""
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json",
@@ -93,6 +90,38 @@ def create_session():
     return session
 
 
+def try_saved_session(session: requests.Session) -> bool:
+    """尝试用已有的 session 访问 profile，成功返回 True"""
+    try:
+        resp = session.get(PROFILE_URL, timeout=10)
+        data = resp.json()
+        if data.get("code") == 1:
+            print(f"[+] 使用已有 session（无需登录）")
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def load_state() -> dict:
+    """加载完整状态（含 cookie）"""
+    default = {"notified_ids": [], "phpsessid": None}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return {**default, **state}
+        except Exception as e:
+            print(f"[!] 状态文件读取失败: {e}")
+    return default
+
+
+def save_state(state: dict):
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def poll_orders(session) -> dict:
     grabid = CONFIG["autoab_grabid"]
     resp = session.get(POLL_URL, params={"grabid": grabid}, timeout=15)
@@ -103,55 +132,67 @@ def poll_orders(session) -> dict:
     return data["data"]
 
 
-def load_state() -> set:
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            return set(state.get("notified_ids", []))
-        except Exception as e:
-            print(f"[!] 状态文件读取失败: {e}")
-    return set()
-
-
-def save_state(notified_ids: set):
-    STATE_FILE.write_text(
-        json.dumps({"notified_ids": list(notified_ids)}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
 def main():
     print(f"[*] 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[*] 目标 GrabID: {CONFIG['autoab_grabid']}")
+
     if not CONFIG["telegram_bot_token"] or not CONFIG["telegram_chat_id"]:
-        print("[!] 请设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID")
+        print("[!] 请设置 Telegram 配置")
         return
-    try:
-        session = create_session()
-    except Exception as e:
-        print(f"[x] {e}")
-        send_telegram(f"❌ <b>autoab 通知出错</b>\n登录失败: {e}")
+    if not CONFIG["autoab_username"] or not CONFIG["autoab_password"]:
+        print("[!] 请设置 autoab 账号")
         return
-    notified_ids = load_state()
+
+    # 加载完整状态
+    state = load_state()
+    notified_ids = set(state.get("notified_ids", []))
+    saved_phpsessid = state.get("phpsessid")
     print(f"[*] 已通知订单数: {len(notified_ids)}")
+
+    # 尝试用已有 cookie
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    })
+    session_ok = False
+
+    if saved_phpsessid:
+        # 设置保存的 cookie
+        session.cookies.set("PHPSESSID", saved_phpsessid, domain="www.autoab.net", path="/")
+        if try_saved_session(session):
+            session_ok = True
+        else:
+            print("[*] 已有 session 已过期，重新登录")
+
+    if not session_ok:
+        # 重新登录
+        session = login_and_get_session()
+        # 保存新的 PHPSESSID
+        for cookie in session.cookies:
+            if cookie.name == "PHPSESSID":
+                state["phpsessid"] = cookie.value
+                print(f"[+] 保存新 session: {cookie.value[:20]}...")
+                break
+
+    # 轮询
     data = poll_orders(session)
     orders = data.get("list", [])
+
     if not orders:
         print("[*] 没有新订单")
-        return
-    new_orders = [o for o in orders if o["id"] not in notified_ids]
-    print(f"[*] 本次获取 {len(orders)} 条，新订单 {len(new_orders)} 条")
-    for order in new_orders:
-        print(f"  -> 订单 #{order['id']}: {order['order_amount']} 马币")
-        notify_new_order(order)
-        notified_ids.add(order["id"])
-        time.sleep(0.5)
-    save_state(notified_ids)
-    print(f"[*] 完成，已通知 ID 数: {len(notified_ids)}")
-    if new_orders:
-        print(f"[+] 成功推送 {len(new_orders)} 条新订单")
     else:
-        print("[*] 无新订单")
+        new_orders = [o for o in orders if o["id"] not in notified_ids]
+        print(f"[*] 获取 {len(orders)} 条，新 {len(new_orders)} 条")
+        for order in new_orders:
+            print(f"  -> 订单 #{order['id']}: {order['order_amount']} 马币")
+            notify_new_order(order)
+            notified_ids.add(order["id"])
+            time.sleep(0.5)
+
+    # 保存状态
+    state["notified_ids"] = list(notified_ids)
+    save_state(state)
+    print(f"[*] 完成")
 
 
 if __name__ == "__main__":
