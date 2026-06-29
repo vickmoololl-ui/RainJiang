@@ -1,6 +1,6 @@
 """
 autoab.net 订单通知监控脚本
-带 session 持久化，减少重复登录
+带 session 持久化 + Google Maps 导航链接
 """
 import os
 import json
@@ -40,6 +40,7 @@ def send_telegram(message: str) -> bool:
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
+            "disable_web_page_preview": True,
         }, timeout=15)
         return resp.json().get("ok", False)
     except Exception as e:
@@ -55,23 +56,28 @@ def notify_new_order(order: dict) -> bool:
     from_loc = order.get("from_location", "?")
     to_loc = order.get("to_location", "?")
     remark = order.get("remark", "")
+
     mode_map = {"to": "去机场", "from": "从机场出发", "fare": "一口价"}
     mode_cn = mode_map.get(match_mode, match_mode)
-    message = (
-        f"🚗 <b>新订单提醒</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"💰 金额：<b>{amount} 马币</b>\n"
-        f"🕐 时间：{order_time}\n"
-        f"🚘 类型：{match_type.upper()} | {mode_cn}\n"
-        f"📍 上车：{from_loc}\n"
-        f"🏁 下车：{to_loc}\n"
-        f"\n{remark}"
-    )
-    return send_telegram(message)
+
+    lines = [f"🚗 <b>新订单提醒</b>"]
+    lines.append(f"💰 金额：<b>{amount} 马币</b>")
+    lines.append(f"🕐 {order_time} ｜ 🚘 {match_type.upper()} | {mode_cn}")
+    lines.append(f"📍 上车：{from_loc}")
+    lines.append(f"🏁 下车：{to_loc}")
+
+    # Google Maps 导航链接
+    import urllib.parse
+    maps_url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(from_loc)}&destination={urllib.parse.quote(to_loc)}"
+    lines.append(f"🗺️ <a href=\"{maps_url}\">Google Maps 导航</a>")
+
+    if remark:
+        lines.append(f"\n{remark}")
+
+    return send_telegram("\n".join(lines))
 
 
 def login_and_get_session() -> requests.Session:
-    """登录并返回带 cookie 的 session"""
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json",
@@ -91,12 +97,11 @@ def login_and_get_session() -> requests.Session:
 
 
 def try_saved_session(session: requests.Session) -> bool:
-    """尝试用已有的 session 访问 profile，成功返回 True"""
     try:
         resp = session.get(PROFILE_URL, timeout=10)
         data = resp.json()
         if data.get("code") == 1:
-            print(f"[+] 使用已有 session（无需登录）")
+            print("[+] 使用已有 session（无需登录）")
             return True
         return False
     except Exception:
@@ -104,7 +109,6 @@ def try_saved_session(session: requests.Session) -> bool:
 
 
 def load_state() -> dict:
-    """加载完整状态（含 cookie）"""
     default = {"notified_ids": [], "phpsessid": None}
     if STATE_FILE.exists():
         try:
@@ -142,13 +146,11 @@ def main():
         print("[!] 请设置 autoab 账号")
         return
 
-    # 加载完整状态
     state = load_state()
     notified_ids = set(state.get("notified_ids", []))
     saved_phpsessid = state.get("phpsessid")
     print(f"[*] 已通知订单数: {len(notified_ids)}")
 
-    # 尝试用已有 cookie
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json",
@@ -157,7 +159,6 @@ def main():
     session_ok = False
 
     if saved_phpsessid:
-        # 设置保存的 cookie
         session.cookies.set("PHPSESSID", saved_phpsessid, domain="www.autoab.net", path="/")
         if try_saved_session(session):
             session_ok = True
@@ -165,16 +166,13 @@ def main():
             print("[*] 已有 session 已过期，重新登录")
 
     if not session_ok:
-        # 重新登录
         session = login_and_get_session()
-        # 保存新的 PHPSESSID
         for cookie in session.cookies:
             if cookie.name == "PHPSESSID":
                 state["phpsessid"] = cookie.value
                 print(f"[+] 保存新 session: {cookie.value[:20]}...")
                 break
 
-    # 轮询
     data = poll_orders(session)
     orders = data.get("list", [])
 
@@ -184,15 +182,14 @@ def main():
         new_orders = [o for o in orders if o["id"] not in notified_ids]
         print(f"[*] 获取 {len(orders)} 条，新 {len(new_orders)} 条")
         for order in new_orders:
-            print(f"  -> 订单 #{order['id']}: {order['order_amount']} 马币")
+            print(f"  -> #{order['id']}: {order['order_amount']} 马币")
             notify_new_order(order)
             notified_ids.add(order["id"])
             time.sleep(0.5)
 
-    # 保存状态
     state["notified_ids"] = list(notified_ids)
     save_state(state)
-    print(f"[*] 完成")
+    print("[*] 完成")
 
 
 if __name__ == "__main__":
