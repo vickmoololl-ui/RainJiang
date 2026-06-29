@@ -1,11 +1,13 @@
 """
 autoab.net 订单通知监控脚本
-带 session 持久化 + Google Maps 导航链接
+带 session 持久化 + Google Maps 导航 + 驾车距离计算
 """
 import os
 import json
 import sys
 import time
+import re
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 try:
@@ -27,6 +29,34 @@ LOGIN_URL = f"{BASE_URL}/user/login"
 PROFILE_URL = f"{BASE_URL}/user/profile"
 POLL_URL = f"{BASE_URL}/grab/poll_orders"
 STATE_FILE = Path(__file__).parent / "state.json"
+GEO_HEADERS = {"User-Agent": "autoab-notify/1.0"}
+
+# 中英文地址翻译对照
+TRANSLATE_MAP = {
+    "吉隆坡": "Kuala Lumpur",
+    "国际机场": "International Airport",
+    "第一终站": "Terminal 1",
+    "第二终站": "Terminal 2",
+    "机场": "Airport",
+    "酒店": "Hotel",
+    "雪邦": "Sepang",
+    "莎阿南": "Shah Alam",
+    "马来西亚": "Malaysia",
+    "柏威年": "Pavilion",
+    "逸林": "DoubleTree",
+    "希尔顿": "Hilton",
+}
+
+# 地址 → 搜索关键词 映射（用于 Nominatim 查不到时的后备）
+# 按前缀匹配，越长越优先
+ADDRESS_ALIAS = [
+    ("Legasi Kampung Baru Residensi", "Kampung Baru, Kuala Lumpur, Malaysia"),
+    ("PV18 Residences", "Bukit Jalil, Kuala Lumpur, Malaysia"),
+    ("i-City", "i-City, Shah Alam, Malaysia"),
+    ("Ulu Bernam", "Ulu Bernam, Selangor, Malaysia"),
+    ("吉隆坡国际机场", "KLIA, Sepang, Malaysia"),
+    ("KLIA", "KLIA, Sepang, Malaysia"),
+]
 
 
 def send_telegram(message: str) -> bool:
@@ -48,6 +78,102 @@ def send_telegram(message: str) -> bool:
         return False
 
 
+# ============================================================
+# 距离计算
+# ============================================================
+
+def _clean(address):
+    """清理地址，去掉房间号后缀"""
+    a = address.strip()
+    a = re.sub(r'\s*[-–]\s*\w+\s*[-–]\s*\w+\s*$', '', a)
+    a = re.sub(r'\s*[-–]\s*\w+\s*$', '', a)
+    a = re.sub(r'\s+', ' ', a).strip()
+    return a
+
+
+def _translate(address):
+    """中文字词转英文"""
+    for cn, en in TRANSLATE_MAP.items():
+        address = address.replace(cn, en + " ")
+    return re.sub(r'\s+', ' ', address).strip()
+
+
+def _find_alias(address):
+    """用别名表查搜索关键词"""
+    for prefix, alias in ADDRESS_ALIAS:
+        if address.startswith(prefix):
+            return alias
+    return None
+
+
+def _geocode(query):
+    """Nominatim 地址转坐标"""
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1},
+            headers=GEO_HEADERS, timeout=10
+        )
+        data = resp.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None, None
+
+
+def get_coordinates(address):
+    """多策略转坐标"""
+    cleaned = _clean(address)
+
+    # 策略1: 直接查
+    lat, lon = _geocode(cleaned)
+    if lat:
+        return lat, lon
+
+    # 策略2: 翻译后查
+    translated = _translate(cleaned)
+    if translated != cleaned:
+        lat, lon = _geocode(translated)
+        if lat:
+            return lat, lon
+
+    # 策略3: 别名查
+    alias = _find_alias(cleaned)
+    if alias:
+        lat, lon = _geocode(alias)
+        if lat:
+            return lat, lon
+
+    return None, None
+
+
+def calc_driving_distance(from_addr, to_addr):
+    """计算两点间驾车距离（公里）"""
+    f_lat, f_lon = get_coordinates(from_addr)
+    if not f_lat:
+        return None
+    time.sleep(1.1)  # Nominatim 限速
+
+    t_lat, t_lon = get_coordinates(to_addr)
+    if not t_lat:
+        return None
+
+    try:
+        url = f"https://router.project-osrm.org/route/v1/driving/{f_lon},{f_lat};{t_lon},{t_lat}?overview=false"
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        if data.get("code") == "Ok" and data["routes"]:
+            return round(data["routes"][0]["distance"] / 1000, 1)
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================
+# 通知消息
+# ============================================================
+
 def notify_new_order(order: dict) -> bool:
     amount = order.get("order_amount", "?")
     order_time = order.get("order_time", "?")
@@ -62,13 +188,27 @@ def notify_new_order(order: dict) -> bool:
 
     lines = [f"🚗 <b>新订单提醒</b>"]
     lines.append(f"💰 金额：<b>{amount} 马币</b>")
-    lines.append(f"🕐 {order_time} ｜ 🚘 {match_type.upper()} | {mode_cn}")
+
+    # 计算距离（不影响主流程）
+    dist = calc_driving_distance(from_loc, to_loc)
+    if dist and amount != "?":
+        ppkm = round(float(amount) / dist, 2)
+        lines.append(f"📏 驾车距离：{dist} km ｜ {ppkm} 马币/km")
+    else:
+        lines.append(f"🕐 {order_time} ｜ 🚘 {match_type.upper()} | {mode_cn}")
+
+    if not (dist and amount != "?"):
+        pass  # 时间和类型已经在上面显示了
+    else:
+        lines.append(f"🕐 {order_time} ｜ 🚘 {match_type.upper()} | {mode_cn}")
+
     lines.append(f"📍 上车：{from_loc}")
     lines.append(f"🏁 下车：{to_loc}")
 
-    # Google Maps 导航链接
-    import urllib.parse
-    maps_url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(from_loc)}&destination={urllib.parse.quote(to_loc)}"
+    # Google Maps 导航链接（地址转英文，让地图搜得准）
+    maps_from = _translate(from_loc) if from_loc != "?" else from_loc
+    maps_to = _translate(to_loc) if to_loc != "?" else to_loc
+    maps_url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(maps_from)}&destination={urllib.parse.quote(maps_to)}"
     lines.append(f"🗺️ <a href=\"{maps_url}\">Google Maps 导航</a>")
 
     if remark:
@@ -77,18 +217,21 @@ def notify_new_order(order: dict) -> bool:
     return send_telegram("\n".join(lines))
 
 
+# ============================================================
+# autoab API
+# ============================================================
+
 def login_and_get_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0"
     })
-    login_data = {
+    resp = session.post(LOGIN_URL, data={
         "username": CONFIG["autoab_username"],
         "password": CONFIG["autoab_password"],
         "keeptime": "31536000",
-    }
-    resp = session.post(LOGIN_URL, data=login_data, timeout=15)
+    }, timeout=15)
     data = resp.json()
     if data.get("code") != 1:
         raise Exception(f"登录失败: {data.get('msg', '未知错误')}")
@@ -114,24 +257,19 @@ def load_state() -> dict:
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             return {**default, **state}
-        except Exception as e:
-            print(f"[!] 状态文件读取失败: {e}")
+        except Exception:
+            return default
     return default
 
 
 def save_state(state: dict):
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def poll_orders(session) -> dict:
-    grabid = CONFIG["autoab_grabid"]
-    resp = session.get(POLL_URL, params={"grabid": grabid}, timeout=15)
+    resp = session.get(POLL_URL, params={"grabid": CONFIG["autoab_grabid"]}, timeout=15)
     data = resp.json()
     if data.get("code") != 1:
-        print(f"[x] 轮询失败: {data.get('msg', '未知错误')}")
         return {"list": []}
     return data["data"]
 
@@ -152,10 +290,7 @@ def main():
     print(f"[*] 已通知订单数: {len(notified_ids)}")
 
     session = requests.Session()
-    session.headers.update({
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    })
+    session.headers.update({"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
     session_ok = False
 
     if saved_phpsessid:
@@ -163,14 +298,13 @@ def main():
         if try_saved_session(session):
             session_ok = True
         else:
-            print("[*] 已有 session 已过期，重新登录")
+            print("[*] 已有 session 过期，重新登录")
 
     if not session_ok:
         session = login_and_get_session()
         for cookie in session.cookies:
             if cookie.name == "PHPSESSID":
                 state["phpsessid"] = cookie.value
-                print(f"[+] 保存新 session: {cookie.value[:20]}...")
                 break
 
     data = poll_orders(session)
