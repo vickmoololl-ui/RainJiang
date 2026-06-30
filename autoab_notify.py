@@ -52,11 +52,20 @@ def send_telegram(message: str) -> bool:
 def notify_new_order(order: dict) -> bool:
     amount = order.get("order_amount", "?")
     order_time = order.get("order_time", "?")
+    match_type = order.get("match_type", "?")
+    match_mode = order.get("match_mode", "?")
     from_loc = order.get("from_location", "")
+    to_loc = order.get("to_location", "")
+
+    mode_map = {"to": "去机场", "from": "从机场出发", "fare": "一口价"}
+    mode_cn = mode_map.get(match_mode, match_mode)
 
     lines = [f"🚗 <b>新订单提醒</b> @rain1203"]
     lines.append(f"💰 金额：<b>{amount} 马币</b>")
     lines.append(f"🕐 {order_time}")
+    lines.append(f"🚘 {match_type.upper()} | {mode_cn}")
+    lines.append(f"📍 上车：{from_loc}")
+    lines.append(f"🏁 下车：{to_loc}")
 
     # Google Maps 导航到上车点（from = 当前位置，to = 上车点）
     dest = f"{from_loc}, Malaysia" if from_loc else ""
