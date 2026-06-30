@@ -54,7 +54,7 @@ def notify_new_order(order: dict) -> bool:
     order_time = order.get("order_time", "?")
     from_loc = order.get("from_location", "")
 
-    lines = [f"🚗 <b>新订单提醒</b>"]
+    lines = [f"🚗 <b>新订单提醒</b> @rain1203"]
     lines.append(f"💰 金额：<b>{amount} 马币</b>")
     lines.append(f"🕐 {order_time}")
 
